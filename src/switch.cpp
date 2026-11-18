@@ -44,15 +44,20 @@ static bool pastDeadline(uint32_t deadlineMs)
 // bounces when it moves: a fault needs the same pattern for 100 ms.
 static constexpr uint32_t FEEDBACK_DEBOUNCE_MS = 100;
 
-// sinceMs: 0 while the condition is not met, else when it started
-static bool persistsFor(bool condition, uint32_t &sinceMs, uint32_t durationMs)
+// Store activation separately so timestamp zero and uint32 wrap are valid.
+static bool persistsFor(bool condition, FeedbackDebounce &timer, uint32_t durationMs)
 {
   if (!condition) {
-    sinceMs = 0;
+    timer.active = false;
     return false;
   }
-  if (sinceMs == 0) sinceMs = nowMs() | 1;
-  return nowMs() - sinceMs >= durationMs;
+  const uint32_t now = nowMs();
+  if (!timer.active) {
+    timer.active = true;
+    timer.sinceMs = now;
+    return false;
+  }
+  return (uint32_t)(now - timer.sinceMs) >= durationMs;
 }
 
 static constexpr uint16_t SAFETY_FAULT_NONE = 0x0000;
@@ -99,13 +104,14 @@ static constexpr uint16_t HEC_STATUS_B1 = 4;
 // memory, so evcc gets the last known values until the wallbox answers again.
 // The contents are random after a power loss, hence the magic and the CRC.
 // Bump the magic when the layout of BootCache changes after a release.
-static constexpr uint32_t BOOT_CACHE_MAGIC = 0x48454331; // "HEC1"
+static constexpr uint32_t BOOT_CACHE_MAGIC = 0x48454332; // "HEC2"
 struct BootCache {
   uint32_t magic;
   uint16_t input[20];
   uint16_t holding[10];
   uint16_t reportedStatus;
   uint8_t desiredPhases;
+  bool safeResume;
   // status page counters, so they count since power-on, not since a restart
   uint32_t switchCount;
   uint32_t wallboxOutages;
@@ -127,6 +133,8 @@ struct TcpClientContext {
 static void pinModeOutput(int pin)
 {
   gpio_reset_pin((gpio_num_t)pin);
+  gpio_set_pull_mode((gpio_num_t)pin, GPIO_PULLDOWN_ONLY);
+  gpio_set_level((gpio_num_t)pin, RELAY_OFF);
   // input too, so the status page can read back the relay state
   gpio_set_direction((gpio_num_t)pin, GPIO_MODE_INPUT_OUTPUT);
 }
@@ -150,8 +158,9 @@ static int readPin(int pin)
 PhaseSwitch::PhaseSwitch()
   :_previous(0)
   ,_delay(0)
-  ,_state(State::WaitingForOff)
+  ,_state(State::AwaitingStart)
   ,_desiredPhases(1)
+  ,_confirmedPhases(0)
   ,_phaseSwitchRequested(false)
   ,_currentWrittenDuringSwitch(false)
   ,_switchingSupported(false)
@@ -227,8 +236,11 @@ PhaseSwitch::PhaseSwitch()
   ,_cachedLockWrites(0)
   ,_updateCurrentWritesSeen(0)
   ,_updateLockWritesSeen(0)
-  ,_bothFeedbackSinceMs(0)
-  ,_invalidFeedbackSinceMs(0)
+  ,_bothFeedbackSinceMs()
+  ,_invalidFeedbackSinceMs()
+  ,_offFeedback()
+  ,_restartStopConfirmed(false)
+  ,_restartResumeAllowed(false)
 {}
 
 void PhaseSwitch::begin(){
@@ -255,6 +267,7 @@ void PhaseSwitch::loadBootCache(){
     // Boot with the phases from before the restart, as evcc expects them.
     if (s_bootCache.desiredPhases == 1 || s_bootCache.desiredPhases == 3) {
       _desiredPhases = s_bootCache.desiredPhases;
+      if (s_bootCache.safeResume) _state = State::WaitingForOff;
     }
     _switchCount = s_bootCache.switchCount;
     _wallboxOutages = s_bootCache.wallboxOutages;
@@ -274,7 +287,8 @@ void PhaseSwitch::saveBootCache(){
     std::copy(_holdingRegister.begin(), _holdingRegister.end(), s_bootCache.holding);
     s_bootCache.reportedStatus = _reportedStatus;
   }
-  s_bootCache.desiredPhases = reportedPhases(); // a pending request wins
+  s_bootCache.desiredPhases = _confirmedPhases;
+  s_bootCache.safeResume = _restartStopConfirmed && _restartResumeAllowed && !hasSafetyFault();
   s_bootCache.switchCount = _switchCount;
   s_bootCache.wallboxOutages = _wallboxOutages;
   s_bootCache.evccTimeouts = _evccTimeouts;
@@ -575,7 +589,21 @@ void PhaseSwitch::loop(){
     }
     return; // nothing else until it is gone or confirmed
   }
-  _bothFeedbackSinceMs = 0;
+  _bothFeedbackSinceMs.active = false;
+
+  if (_state == State::AwaitingStart) return;
+
+  if ((_state == State::SwitchPhases || _state == State::WaitingForZero
+      || _state == State::Delay || _state == State::Unlocking)
+      && _confirmedPhases != 0) {
+    if (!feedbackMatches(_confirmedPhases)) {
+      if (persistsFor(true, _invalidFeedbackSinceMs, FEEDBACK_DEBOUNCE_MS)) {
+        enterSafetyFault(SAFETY_FAULT_RUNNING_FEEDBACK_INVALID, "contactor feedback changed during transition");
+      }
+      return;
+    }
+    _invalidFeedbackSinceMs.active = false;
+  }
 
   if (_delay > 0){
     if (nowMs() - _previous < _delay){
@@ -585,7 +613,7 @@ void PhaseSwitch::loop(){
   }
   
   if (_state == State::WaitingForOff){
-    if (readPin(PIN_1P_IN) == 0 && readPin(PIN_3P_IN) == 0){
+    if (outputsConfirmedOff()){
       ESP_LOGI(TAG, "confirmed off");
       _switchingSupported = true;
       _switchOffDeadlineMs = 0;
@@ -604,6 +632,12 @@ void PhaseSwitch::loop(){
     return;
   }
   else if (_state == State::ConfirmedOff){
+    if (readPin(PIN_1P_IN) != 0 || readPin(PIN_3P_IN) != 0) {
+      _state = State::WaitingForOff;
+      _switchOffDeadlineMs = nowMs() + SWITCH_CONFIRM_TIMEOUT_MS;
+      _offFeedback.active = false;
+      return;
+    }
     const uint32_t now = nowMs();
     if (_desiredPhases == 3){
       ESP_LOGI(TAG, "switching on 3p");
@@ -637,13 +671,15 @@ void PhaseSwitch::loop(){
   }
 
   if (_state == State::Running) {
-    if (oneFeedback == threeFeedback) {
+    if (!feedbackMatches(_desiredPhases)) {
       if (persistsFor(true, _invalidFeedbackSinceMs, FEEDBACK_DEBOUNCE_MS)) {
         enterSafetyFault(SAFETY_FAULT_RUNNING_FEEDBACK_INVALID, "invalid contactor feedback while running");
       }
       return;
     }
-    _invalidFeedbackSinceMs = 0;
+    _invalidFeedbackSinceMs.active = false;
+
+    if (_updateInProgress) return;
 
     // A phase request that came in while not Running.
     const uint8_t requested = _requestedPhases.exchange(0);
@@ -715,6 +751,7 @@ void PhaseSwitch::loop(){
     return;
   }
   else if (_state == State::ConfirmedZero){
+    _confirmedPhases = 0;
     writePin(PIN_1P_OUT, RELAY_OFF);
     writePin(PIN_3P_OUT, RELAY_OFF);
     _switchOffDeadlineMs = nowMs() + SWITCH_CONFIRM_TIMEOUT_MS;
@@ -763,6 +800,7 @@ void PhaseSwitch::loop(){
       return;
     }
     ESP_LOGI(TAG, "confirmed %up", (unsigned)desired);
+    _confirmedPhases = desired;
     _state = State::Delay;
     _previous = nowMs();
     _delay = _switchDelay;
@@ -828,6 +866,9 @@ void PhaseSwitch::loop(){
         }
         writesSeen = _cachedCurrentWrites;
         newer = _holdingRegister[HEC_REG_MAX_CURRENT - HOLDING_REG_OFFSET];
+        // A boot is not a phase change: concurrent cached requests must not
+        // restore charging before the initial zero-current handover completes.
+        if (!_phaseSwitchRequested) newer = 0;
       }
       ESP_LOGI(TAG, "evcc wrote %u.%u A meanwhile, sending it", newer / 10, newer % 10);
       if (masterWriteHolding(HEC_REG_MAX_CURRENT, newer) != ESP_OK) {
@@ -846,7 +887,7 @@ void PhaseSwitch::loop(){
     // The Heidelberg reports "locked" for a few seconds after the unlock.
     // Keep serving the cache meanwhile, evcc rejects status 10.
     uint16_t status;
-    if (masterReadInput(5, 1, &status) == ESP_OK && status != 10) {
+    if (masterReadInput(5, 1, &status) == ESP_OK && status >= 2 && status <= 7) {
       ESP_LOGI(TAG, "unlock confirmed");
       _lastWallboxOkMs = nowMs();
       finishSwitchStats();
@@ -857,12 +898,8 @@ void PhaseSwitch::loop(){
     }
     if (pastDeadline(_unlockDeadlineMs)) {
       ESP_LOGW(TAG, "timeout waiting for unlock, writing it again");
-      masterWriteHolding(HEC_REG_REMOTE_LOCK, 1);
-      _lastWallboxOkMs = nowMs();
-      finishSwitchStats();
-      _carQuietUntilMs = nowMs() + CAR_EVENT_QUIET_MS;
-      _carQuiet = true;
-      _state = State::Running;
+      if (masterWriteHolding(HEC_REG_REMOTE_LOCK, 1) != ESP_OK) checkWallboxSilent();
+      _unlockDeadlineMs = nowMs() + UNLOCK_CONFIRM_TIMEOUT_MS;
       return;
     }
     _previous = nowMs();
@@ -880,6 +917,7 @@ bool PhaseSwitch::writeRestartStop(){
   }
   if (masterWriteHolding(HEC_REG_REMOTE_LOCK, 0) != ESP_OK) {
     ESP_LOGW(TAG, "restarting, could not lock the wallbox");
+    return false;
   }
   return true;
 }
@@ -891,47 +929,68 @@ void PhaseSwitch::requestRestart(){
 // Restarting drops the contactors. Stop charging first so they never open
 // under load; a Heidelberg cut off while charging may not answer afterwards.
 // While Restarting, Modbus writes from evcc only go to the cache.
+bool PhaseSwitch::feedbackMatches(uint8_t phases){
+  const bool one = readPin(PIN_1P_IN) == 1;
+  const bool three = readPin(PIN_3P_IN) == 1;
+  return phases == 1 ? one && !three : phases == 3 && three && !one;
+}
+
+bool PhaseSwitch::outputsConfirmedOff(){
+  return persistsFor(readPin(PIN_1P_OUT) == RELAY_OFF && readPin(PIN_3P_OUT) == RELAY_OFF
+    && readPin(PIN_1P_IN) == 0 && readPin(PIN_3P_IN) == 0,
+    _offFeedback, FEEDBACK_DEBOUNCE_MS);
+}
+
+bool PhaseSwitch::prepareUpdate(){
+  std::lock_guard<std::mutex> lock(_stateMutex);
+  if (_restartRequested || (_state != State::Running && _state != State::AwaitingStart
+      && _state != State::Fault)) return false;
+  if (!_updateInProgress) setUpdateInProgress(true);
+  if (outputsConfirmedOff()) return true;
+  if (!_master_handle || hasSafetyFault()) return false;
+  uint16_t data[4];
+  return writeRestartStop() && masterReadInput(5, 4, data) == ESP_OK
+    && data[0] == 10 && data[1] == 0 && data[2] == 0 && data[3] == 0;
+}
+
 void PhaseSwitch::handleRestart(){
   if (_state != State::Restarting) {
-    // During a phase switch the car may still draw current until the
-    // contactors are off: in SwitchPhases the 0 A write may not have gone
-    // through yet, in WaitingForZero the car is still ramping down. Delay
-    // may already have unlocked the wallbox with a current when it retries
-    // sending evcc's newest current. In the other states the contactors are
-    // off or the wallbox is not charging yet.
-    const bool mayCharge = _state == State::Running || _state == State::Unlocking
-      || _state == State::SwitchPhases || _state == State::WaitingForZero
-      || _state == State::Delay;
+    _restartResumeAllowed = !hasSafetyFault() && (_confirmedPhases == 1 || _confirmedPhases == 3);
+    _restartStopConfirmed = false;
+    _restartStopWritten = false;
     if (_state == State::Running) rememberCarState();
-    if (!mayCharge || !_master_handle || hasSafetyFault()) {
-      ESP_LOGI(TAG, "restarting");
-      restartNow();
-    }
     _state = State::Restarting;
     _restartDeadlineMs = nowMs() + RESTART_STOP_TIMEOUT_MS;
-    _previous = nowMs();
-    _delay = 0;
-    _restartStopWritten = writeRestartStop();
-    ESP_LOGI(TAG, "restart requested, waiting for lock and zero current");
-    return;
+    _previous = nowMs() - 500;
   }
-
   if (nowMs() - _previous < 500) return;
   _previous = nowMs();
-  // A failed write must not open the contactors under load: try again
-  // until the deadline.
-  if (!_restartStopWritten) _restartStopWritten = writeRestartStop();
-
-  uint16_t data[4];
-  const bool stopped = masterReadInput(5, 4, data) == ESP_OK
-    && data[0] == 10 && data[1] == 0 && data[2] == 0 && data[3] == 0;
-  if (stopped) {
-    ESP_LOGI(TAG, "lock and zero current confirmed, restarting");
+  if (!hasSafetyFault() && _confirmedPhases != 0 && !feedbackMatches(_confirmedPhases)) {
+    if (persistsFor(true, _invalidFeedbackSinceMs, FEEDBACK_DEBOUNCE_MS)) {
+      enterSafetyFault(SAFETY_FAULT_RUNNING_FEEDBACK_INVALID, "contactor feedback changed during restart");
+    }
+    return;
+  }
+  _invalidFeedbackSinceMs.active = false;
+  // Already-open outputs and feedback cannot be dropped by this restart.
+  if (outputsConfirmedOff()) {
+    _restartResumeAllowed = false;
     restartNow();
   }
+  if (_master_handle) {
+    if (!_restartStopWritten) _restartStopWritten = writeRestartStop();
+    uint16_t data[4];
+    if (_restartStopWritten && masterReadInput(5, 4, data) == ESP_OK
+        && data[0] == 10 && data[1] == 0 && data[2] == 0 && data[3] == 0) {
+      _restartStopConfirmed = true;
+      _restartResumeAllowed = _restartResumeAllowed && feedbackMatches(_confirmedPhases);
+      restartNow();
+    }
+  }
   if (pastDeadline(_restartDeadlineMs)) {
-    ESP_LOGW(TAG, "timeout waiting for lock and zero current, restarting");
-    restartNow();
+    ESP_LOGW(TAG, "restart blocked: lock and zero current not confirmed; retrying");
+    _restartStopWritten = false;
+    _restartDeadlineMs = nowMs() + RESTART_STOP_TIMEOUT_MS;
   }
 }
 
@@ -958,6 +1017,14 @@ void PhaseSwitch::abortSwitch(){
 
 void PhaseSwitch::startSwitch(uint8_t phases, uint8_t source){
   if (phases == 1 ? !canSwitchTo1P() : !canSwitchTo3P()) return;
+  if (_state == State::AwaitingStart) {
+    _desiredPhases = phases;
+    _confirmedPhases = 0;
+    _requestedPhases = 0;
+    _phaseSwitchRequested = false;
+    _state = State::WaitingForOff;
+    return;
+  }
   rememberCarState();
   // kept for abortSwitch(), which puts the status page back
   _prevSwitchFrom = _lastSwitchFrom.load();
@@ -986,23 +1053,24 @@ void PhaseSwitch::switchTo3P(){
   startSwitch(3, (uint8_t)SwitchSource::WebPage);
 }
 
-// Phase request from evcc (register 4). Outside Running the request is kept
-// and run once the board is back in Running, so evcc's request is never
-// dropped and reading register 4 returns what evcc asked for.
-void PhaseSwitch::requestPhases(uint8_t phases){
+// Queue a phase request during a regular transition. Reset hold, faults, OTA
+// and restart reject requests; register 4 reports feedback, not the queue.
+bool PhaseSwitch::requestPhases(uint8_t phases){
   std::lock_guard<std::mutex> lock(_stateMutex);
+  if ((phases != 1 && phases != 3) || hasSafetyFault() || _updateInProgress
+      || _restartRequested || _state == State::AwaitingStart) return false;
   if (_state == State::Running && _firmwareSupported) {
     _requestedPhases = 0;
     startSwitch(phases, (uint8_t)SwitchSource::Evcc);
-    return;
+  } else {
+    _requestedPhases = phases;
   }
-  _requestedPhases = phases;
-  ESP_LOGI(TAG, "keeping the switch to %up until Running", phases);
+  return true;
 }
 
 uint8_t PhaseSwitch::reportedPhases(){
-  const uint8_t requested = _requestedPhases;
-  return requested ? requested : _desiredPhases.load();
+  const uint8_t phases = _confirmedPhases;
+  return !hasSafetyFault() && feedbackMatches(phases) ? phases : 0;
 }
 
 // The ESP32 polls the wallbox every 2 s and so keeps the Heidelberg's own
@@ -1201,6 +1269,9 @@ std::string PhaseSwitch::wallboxInfoText(){
 }
 
 bool PhaseSwitch::canSwitchTo1P(){
+  if (_updateInProgress || _restartRequested || hasSafetyFault()) return false;
+  if (_state == State::AwaitingStart) return _masterStarted
+    && readPin(PIN_1P_IN) == 0 && readPin(PIN_3P_IN) == 0;
   return _switchingSupported
     && _firmwareSupported
     && _state == State::Running
@@ -1208,6 +1279,9 @@ bool PhaseSwitch::canSwitchTo1P(){
 }
 
 bool PhaseSwitch::canSwitchTo3P(){
+  if (_updateInProgress || _restartRequested || hasSafetyFault()) return false;
+  if (_state == State::AwaitingStart) return _masterStarted
+    && readPin(PIN_1P_IN) == 0 && readPin(PIN_3P_IN) == 0;
   return _switchingSupported
     && _firmwareSupported
     && _state == State::Running
@@ -1230,6 +1304,7 @@ void PhaseSwitch::enterSafetyFault(uint16_t code, const char *text){
 
   _safetyFaultText = text ? text : "unspecified safety fault";
   _safetyFaultCode = code;
+  _confirmedPhases = 0;
   _delay = 0;
   _switchOnDeadlineMs = 0;
   writePin(PIN_1P_OUT, RELAY_OFF);
@@ -1251,6 +1326,7 @@ std::string PhaseSwitch::getState(){
   else result = "~P ";
 
   switch(_state){
+    case State::AwaitingStart: result += "AwaitingStart (manual start required)"; break;
     case State::Running: result += "Running"; break;
     case State::SwitchPhases: result += "SwitchPhases"; break;
     case State::WaitingForZero: result += "WaitingForZero"; break;
@@ -1734,7 +1810,10 @@ bool PhaseSwitch::handleWriteHolding(uint8_t, uint16_t addr, uint16_t value, std
 {
   if (_switchingSupported && addr == 4) {
     if (value == 1 || value == 3) {
-      requestPhases((uint8_t)value);
+      if (!requestPhases((uint8_t)value)) {
+        buildException(FC_WRITE_HOLDING, 6, responsePdu);
+        return true;
+      }
     } else {
       buildException(FC_WRITE_HOLDING, EX_ILLEGAL_DATA_VALUE, responsePdu);
       return true;
@@ -1793,7 +1872,10 @@ bool PhaseSwitch::handleWriteMultiple(uint8_t, uint16_t addr, uint16_t count, co
   // Register 4 (phases) like in handleWriteHolding; never part of a range.
   if (_switchingSupported && addr <= 4 && 4 < addr + count) {
     if (addr == 4 && count == 1 && (values[0] == 1 || values[0] == 3)) {
-      requestPhases((uint8_t)values[0]);
+      if (!requestPhases((uint8_t)values[0])) {
+        buildException(FC_WRITE_MULTIPLE, 6, responsePdu);
+        return true;
+      }
       responsePdu = {FC_WRITE_MULTIPLE};
       appendU16be(responsePdu, addr);
       appendU16be(responsePdu, count);

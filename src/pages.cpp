@@ -206,35 +206,19 @@ static void redirect(httpd_req_t *req, const char *location)
   httpd_resp_send(req, nullptr, 0);
 }
 
-// Upper bound for the phase switch to stop charging before a forced restart.
-static constexpr uint64_t RESTART_FALLBACK_US = 15000000;
-
-static void scheduleRestart(uint64_t delayUs)
+static bool scheduleRestart(uint64_t delayUs)
 {
+  if (!s_phase_switch) return false;
   if (s_restart_timer == nullptr) {
     esp_timer_create_args_t args = {};
     args.callback = [](void *) {
-      if (s_phase_switch == nullptr) {
-        eventLogLockForRestart();
-        esp_restart();
-      }
-      // Let the phase switch stop charging and restart; force it if that hangs.
-      s_phase_switch->requestRestart();
-      esp_timer_create_args_t fallbackArgs = {};
-      fallbackArgs.callback = [](void *) { eventLogLockForRestart(); esp_restart(); };
-      fallbackArgs.name = "restart_fallback";
-      esp_timer_handle_t fallback = nullptr;
-      if (esp_timer_create(&fallbackArgs, &fallback) != ESP_OK
-          || esp_timer_start_once(fallback, RESTART_FALLBACK_US) != ESP_OK) {
-        eventLogLockForRestart();
-        esp_restart();
-      }
+      if (s_phase_switch) s_phase_switch->requestRestart();
     };
     args.name = "restart";
-    esp_timer_create(&args, &s_restart_timer);
+    if (esp_timer_create(&args, &s_restart_timer) != ESP_OK) return false;
   }
   esp_timer_stop(s_restart_timer);
-  esp_timer_start_once(s_restart_timer, delayUs);
+  return esp_timer_start_once(s_restart_timer, delayUs) == ESP_OK;
 }
 
 static bool hasSavedWifiCredentials()
@@ -568,7 +552,9 @@ static esp_err_t handleRebootPost(httpd_req_t *req)
   sendResponseTrailer(body);
   sendHtml(req, body);
   eventLog(EventType::RestartRequested, (uint8_t)RestartSource::WebPage);
-  scheduleRestart(250000);
+  if (!scheduleRestart(250000) && s_phase_switch) {
+    s_phase_switch->requestRestart();
+  }
   return ESP_OK;
 }
 
@@ -878,11 +864,20 @@ static esp_err_t handleUpdatePost(httpd_req_t *req)
   // Erasing the partition in esp_ota_begin() already stalls Modbus RTU.
   // The upload either ends in a restart or fails; on failure evcc is served
   // by the wallbox again.
-  if (s_phase_switch) s_phase_switch->setUpdateInProgress(true);
+
   struct UpdateGuard {
     bool done = false;
     ~UpdateGuard() { if (!done && s_phase_switch) s_phase_switch->setUpdateInProgress(false); }
   } guard;
+  bool stopped = false;
+  for (int i = 0; i < 100 && s_phase_switch; ++i) {
+    if (s_phase_switch->prepareUpdate()) { stopped = true; break; }
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+  if (!stopped) {
+    sendText(req, "409 Conflict", "Update blocked: lock and zero current not confirmed");
+    return ESP_OK;
+  }
   // From here evcc is served from the cache, but a request already on its
   // way to the wallbox would time out while the erase stalls the RTU master
   // (evcc sees exception 4): let it finish first, at most 1.5 s.
@@ -938,10 +933,13 @@ static esp_err_t handleUpdatePost(httpd_req_t *req)
     return ESP_OK;
   }
 
+  if (!scheduleRestart(500000)) {
+    sendText(req, "500 Internal Server Error", "Image written, but safe restart could not be scheduled");
+    return ESP_OK;
+  }
   guard.done = true;
-  sendText(req, "200 OK", "Update successful. Rebooting...");
+  sendText(req, "200 OK", "Update successful. Waiting for safe restart...");
   eventLog(EventType::RestartRequested, (uint8_t)RestartSource::FirmwareUpdate);
-  scheduleRestart(500000);
   return ESP_OK;
 }
 
@@ -974,7 +972,9 @@ static esp_err_t handleWifiPost(httpd_req_t *req)
   sendResponseTrailer(body);
   sendHtml(req, body);
   eventLog(EventType::RestartRequested, (uint8_t)RestartSource::WifiSettings);
-  scheduleRestart(300000);
+  if (!scheduleRestart(300000) && s_phase_switch) {
+    s_phase_switch->requestRestart();
+  }
   return ESP_OK;
 }
 
@@ -1105,7 +1105,9 @@ static esp_err_t handleWifiSetupPost(httpd_req_t *req)
   sendResponseTrailer(body);
   sendHtml(req, body);
   eventLog(EventType::RestartRequested, (uint8_t)RestartSource::WifiSettings);
-  scheduleRestart(300000);
+  if (!scheduleRestart(300000) && s_phase_switch) {
+    s_phase_switch->requestRestart();
+  }
   return ESP_OK;
 }
 

@@ -4,8 +4,22 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
+  simulation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Firmware safety regressions without hardware
+        run: python3 test/host/safety_sim.py
+
   build:
+    needs: simulation
     runs-on: ubuntu-latest
     permissions:
       contents: write # create draft releases for version tags

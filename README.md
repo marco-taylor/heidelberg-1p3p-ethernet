@@ -1,5 +1,13 @@
 # Phasenumschaltung für Heidelberg Energy Control
 
+> **Sicherheitskorrekturen im Entwicklungsbranch:** Nach Kaltstart, Brownout,
+> Watchdog oder Absturz bleiben die Ausgänge aus, bis im Web bewusst 1P/3P
+> gewählt wird. Ein kontrollierter Neustart wartet auf bestätigte Sperre und
+> Nullstrom. Register 4 meldet bestätigte Phasen statt vorgemerkter Aufträge.
+> Details, Tests und offene Hardwareprüfungen: [Sicherheitsbericht](docs/HEIDELBERG_SAFETY_AUDIT.md).
+> Zugehöriger evcc-Fork: [marco-taylor/evcc-heidelberg-1p3p](https://github.com/marco-taylor/evcc-heidelberg-1p3p).
+> Dieser Entwicklungsstand ist nicht für den Leistungsbetrieb freigegeben.
+
 > **Hinweis:** Dies ist ein Fork von [zivillian/heidelberg-1p3p](https://github.com/zivillian/heidelberg-1p3p).
 > Idee, Hardware-Aufbau und die Projektbeschreibung unten stammen von dort.
 > Unterschiede in diesem Fork:
