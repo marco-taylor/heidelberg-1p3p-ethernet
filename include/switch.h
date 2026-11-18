@@ -21,6 +21,7 @@
     #define HOLDING_REG_OFFSET (uint16_t)256
 
     enum State {
+        AwaitingStart,
         //wait for phase switch
         Running,
         //received request to switch phases
@@ -43,6 +44,11 @@
         Unlocking,
         //restart requested: sent MaxCurrent=0 and lock, waiting for both
         Restarting,
+    };
+
+    struct FeedbackDebounce {
+        bool active = false;
+        uint32_t sinceMs = 0;
     };
 
     // A mutex that hands the lock out in the order it was requested. A
@@ -74,6 +80,7 @@
             uint32_t _delay;
             std::atomic<State> _state; // read by the bridge tasks without the mutex
             std::atomic<uint8_t> _desiredPhases;
+            std::atomic<uint8_t> _confirmedPhases;
             bool _phaseSwitchRequested; // false while the boot sequence runs
             bool _currentWrittenDuringSwitch; // evcc set the current for the new phase count
             std::atomic<bool> _switchingSupported;
@@ -168,10 +175,15 @@
             uint32_t _cachedCurrentWrites; // evcc writes of 261 into the cache, under _cacheMutex
             uint32_t _cachedLockWrites;    // the same for 259
             uint32_t _updateCurrentWritesSeen, _updateLockWritesSeen;
-            uint32_t _bothFeedbackSinceMs;    // debounce, main loop only
-            uint32_t _invalidFeedbackSinceMs;
+            FeedbackDebounce _bothFeedbackSinceMs;
+            FeedbackDebounce _invalidFeedbackSinceMs;
+            FeedbackDebounce _offFeedback;
+            bool _restartStopConfirmed;
+            bool _restartResumeAllowed;
+            bool outputsConfirmedOff();
+            bool feedbackMatches(uint8_t phases);
             void handleRestart();
-            void requestPhases(uint8_t phases);
+            bool requestPhases(uint8_t phases);
             // source: SwitchSource from event_log.h, for the event log
             void startSwitch(uint8_t phases, uint8_t source);
             uint8_t reportedPhases();
@@ -226,6 +238,7 @@
             void requestRestart();
             // Answer evcc from the cache while an OTA upload stalls Modbus RTU.
             void setUpdateInProgress(bool inProgress);
+            bool prepareUpdate();
             bool isWallboxSilent();
             uint32_t wallboxSilentForMs();
             std::string wallboxStatusText();
